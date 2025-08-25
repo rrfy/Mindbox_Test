@@ -1,0 +1,124 @@
+# Изолируем приложение в отдельном namespace и даём ему имя для удобства дальнейшей разработки
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: web-app
+  labels:
+    name: web-app
+
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app-deployment
+  namespace: web-app
+  labels:
+    app: web-app
+spec:
+  replicas: 4 # 4 пода справляются с пиковой нагрузкой
+  strategy:
+    type: RollingUpdate # Плавное обновление для избежания даунтайма
+    rollingUpdate:
+      maxSurge: 1 # Можно одновременно запустить на 1 под больше желаемого количества
+      maxUnavailable: 0 # Во время обновления при пиковой нагрузке нельзя терять ни одного подa 
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      topologySpreadConstraints: # ОТКАЗОУСТОЙЧИВОСТЬ
+        - maxSkew: 1 # Максимальная разница в количестве подов между зонами не более 1 для равномерного распределения и высокой отказоустойчивости
+          topologyKey: topology.kubernetes.io/zone # Распределять по зонам (domain failure)
+          whenUnsatisfiable: ScheduleAnyway # Стараться соблюсти правило, но если нельзя - все равно запускать под
+        - maxSkew: 1 # Также распределяем по самим нодам так же для высокой отказоустойчивости
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+      containers:
+      - name: web-app
+        image: mindbox/the-most-important-web-app:latest
+        ports:
+        - containerPort: 8080 
+        resources:
+          requests:
+            memory: "144Mi" # Память !!!В РАЙОНЕ!!! 128M по нагрузочнуму тестированию. -> Cтавим чуть больше
+            cpu: "100m"     # Запрашиваем 0.1 CPU . Этого хватит для стабильной работы
+          limits:
+            memory: "200Mi" # Даем лимит по памяти чуть больше на случай непредвиденных обстоятельст
+            cpu: "700m"     # "на первые запросы приложению требуется значительно больше ресурсов CPU" -> Лимит CPU выставлен выше, чтобы покрыть пиковую нагрузку на первые запросы
+        startupProbe: # Т. К. Приложение стартует не стразу надо проверить его на готовность
+          httpGet:
+            path: /health # Стандартный эндпойнт
+            port: 8080
+          failureThreshold: 20 # Приложение инициализируется 5-10 сек. Дадим запас в 10 секунд
+          periodSeconds: 1
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10 # Даем время на запуск после успешного startupProbe
+          periodSeconds: 10
+      terminationGracePeriodSeconds: 30 # Время на корректное завершение работы приложения после получения сигнала SIGTERM. Чтоб оно не простаивало и не ело ресурсы в случае отказа
+
+
+# Надо учесть разницу по нагрузке днём и ночью, для этого будем использовать HorizontalPodAutoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app-hpa
+  namespace: web-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app-deployment
+  minReplicas: 1 # Минимум 1 под для обработки ночного трафика "ночью запросов на порядки меньше"
+  maxReplicas: 4 # Максимум 4 пода, так как известно, что этого хватает на пик
+  behavior: # Настройка поведения масштабирования для плавного регулирования количества подов
+    scaleDown:
+      stabilizationWindowSeconds: 300 # Ждем 5 минут стабильно низкой нагрузки, прежде чем уменьшить количество подов. Защита от резких спадов при обычных или высоких нагрузках
+      policies:
+      - type: Percent
+        value: 50 # Позволяем уменьшать количество подов не более чем на 50% за раз, опять таки же для защиты от резких спадов
+        periodSeconds: 60
+# В сторону повышения количества подов это правило применять не нужно, т. к. такое резкое повышение нагрузки скорее всего будет спровоцированно DDoS или DoS атакой
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70 # Целевая утилизация CPU 70%. HPA будет добавлять/убирать поды, чтобы выйти на этот показатель. Сделано для оптимизации потребления ресурсов
+
+
+apiVersion: v1
+kind: Service # Для вывода приложения в сеть
+metadata:
+  name: web-app-service
+  namespace: web-app
+  labels:
+    app: web-app
+spec:
+  selector:
+    app: web-app
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080 # тот же порт, что и раньше
+  type: ClusterIP # Сделал тип ClusterIP, так как , трафик будет идет изнутри кластера через Ingress
+
+
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget # Чтобы приложение не ложелось во время тех. работ
+metadata:
+  name: web-app-pdb
+  namespace: web-app
+spec:
+  minAvailable: 3 #Гарантируем, что как минимум 3 пода из 4 всегда будут доступны.
+  selector:
+    matchLabels:
+      app: web-app
